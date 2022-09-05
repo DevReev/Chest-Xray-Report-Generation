@@ -1,26 +1,21 @@
 import tensorflow as tf
 import pickle
-from fastapi import FastAPI, File, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import os
+from google.cloud import storage
 
-app = FastAPI()
+image_features_extract_model = None
 
-origins = [
-    "http://localhost",
-    "http://localhost:3000",
-]
+BUCKET_NAME = "medical-report-generation" # Here you need to put the name of your GCP bucket
 
-# Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
+def download_blob(bucket_name, source_blob_name, destination_file_name):
+    """Downloads a blob from the bucket."""
+    storage_client = storage.Client()
+    bucket = storage_client.get_bucket(bucket_name)
+    blob = bucket.blob(source_blob_name)
+
+    blob.download_to_filename(destination_file_name)
+
+    print(f"Blob {source_blob_name} downloaded to {destination_file_name}.")
 
 embedding_dim = 256
 units = 512
@@ -37,38 +32,6 @@ def standardize(inputs):
   inputs = tf.strings.lower(inputs)
   return tf.strings.regex_replace(inputs,
                                   r"!\"#$%&\(\)\*\+.,-/:;=?@\[\\\]^_`{|}~", "")
-
-from_disk = pickle.load(open("tv_layer.pkl", "rb"))
-new_v = tf.keras.layers.TextVectorization.from_config(from_disk['config'])
-# You have to call `adapt` with some dummy data (BUG in Keras)
-new_v.adapt(tf.data.Dataset.from_tensor_slices(["xyz"]))
-new_v.set_weights(from_disk['weights'])
-
-# print(new_v.get_vocabulary())
-
-# Create mappings for words to indices and indicies to words.
-word_to_index = tf.keras.layers.StringLookup(
-    mask_token="",
-    vocabulary=new_v.get_vocabulary())
-index_to_word = tf.keras.layers.StringLookup(
-    mask_token="",
-    vocabulary=new_v.get_vocabulary(),
-    invert=True)
-
-
-image_model = tf.keras.applications.DenseNet121(include_top=False,
-                                                weights=None, pooling="avg")
-predictions = tf.keras.layers.Dense(14, activation='sigmoid', name='predictions')(image_model.output)
-
-image_model = tf.keras.Model(inputs=image_model.input, outputs=predictions)
-image_model.load_weights("chexnet.3.0_weights.h5")
-
-# (image_model.summary())
-
-new_input = image_model.input
-hidden_layer = image_model.layers[-1].output
-
-image_features_extract_model = tf.keras.Model(new_input, hidden_layer)
 
 class BahdanauAttention(tf.keras.Model):
 
@@ -157,20 +120,8 @@ class RNN_Decoder(tf.keras.Model):
   def reset_state(self, batch_size):
     return tf.zeros((batch_size, self.units))
 
-encoder = CNN_Encoder(embedding_dim)
-decoder = RNN_Decoder(embedding_dim, units, new_v.vocabulary_size())
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=3e-4)
-
-checkpoint_path = "checkpoint"
-ckpt = tf.train.Checkpoint(encoder=encoder,
-                           decoder=decoder,
-                           optimizer=optimizer)
-ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
-
-ckpt.restore(ckpt_manager.latest_checkpoint)
-
-def evaluate(image):
+def evaluate(image, decoder, encoder, word_to_index, index_to_word, image_features_extract_model):
 
     hidden = decoder.reset_state(batch_size=1)
 
@@ -204,29 +155,90 @@ def evaluate(image):
 
     return result
 
-# test_image_path = 'ex-1.png'
+def predict(request):
 
-# print(" ")
-# print(' ' .join(evaluate(test_image_path)))
+  if request.method == 'OPTIONS':
+        # Allows GET requests from any origin with the Content-Type
+        # header and caches preflight response for an 3600s
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '3600'
+        }
 
-@app.post("/predict")
-async def predict(
-    file: UploadFile = File(...)
-):
-    image = file.filename
-    # Print prediction excluding 'end' token
-
-    print(str(evaluate(image)).split('<end>')[0])
-    prediction = ' '.join(evaluate(image))
-    # prediction = ' '.join(str(evaluate(image)).split('<end>')[0])
-    # prediction = str(evaluate(image)).split('<end>')[0]
-    prediction.replace('<end>', '')
-    return {
-        'prediction': prediction,
+        return ('', 204, headers)
+  
+  # Set CORS headers for the main request
+  headers = {
+        'Access-Control-Allow-Origin': '*'
     }
 
-if __name__ == "__main__":
-    # uvicorn.run(app, host='localhost', port=8000)
-    port = int(os.environ.get('PORT', 5000))
-    uvicorn.run(app, host='localhost', port=8000)
-    # app.run(debug=True, host='0.0.0.0', port=port)
+  global image_features_extract_model
+  if image_features_extract_model is None:
+        download_blob(
+            BUCKET_NAME,
+            "models/chexnet.3.0_weights.h5",
+            "/tmp/chexnet.3.0_weights.h5",
+        )
+        image_model = tf.keras.applications.DenseNet121(include_top=False,
+                                                weights=None, pooling="avg")
+        predictions = tf.keras.layers.Dense(14, activation='sigmoid', name='predictions')(image_model.output)
+
+        image_model = tf.keras.Model(inputs=image_model.input, outputs=predictions)
+        image_model.load_weights("/tmp/chexnet.3.0_weights.h5")
+
+        # (image_model.summary())
+
+        new_input = image_model.input
+        hidden_layer = image_model.layers[-1].output
+
+        image_features_extract_model = tf.keras.Model(new_input, hidden_layer)
+    
+  prefix = 'checkpoint/'
+  dl_dir = '/tmp/checkpoint/'
+  storage_client = storage.Client()
+  bucket = storage_client.get_bucket(BUCKET_NAME)
+  blobs = bucket.list_blobs(prefix=prefix)  # Get list of files
+  for blob in blobs:
+      filename = blob.name.replace('/', '_') 
+      blob.download_to_filename(dl_dir + filename)  # Download
+      
+  download_blob(
+          BUCKET_NAME,
+          "models/tv_layer.pkl",
+          "/tmp/tv_layer.pkl",
+      )
+  from_disk = pickle.load(open("/tmp/tv_layer.pkl", "rb"))
+  new_v = tf.keras.layers.TextVectorization.from_config(from_disk['config'])
+  # You have to call `adapt` with some dummy data (BUG in Keras)
+  new_v.adapt(tf.data.Dataset.from_tensor_slices(["xyz"]))
+  new_v.set_weights(from_disk['weights'])
+
+  # print(new_v.get_vocabulary())
+
+  # Create mappings for words to indices and indicies to words.
+  word_to_index = tf.keras.layers.StringLookup(
+      mask_token="",
+      vocabulary=new_v.get_vocabulary())
+  index_to_word = tf.keras.layers.StringLookup(
+      mask_token="",
+      vocabulary=new_v.get_vocabulary(),
+      invert=True)
+  encoder = CNN_Encoder(embedding_dim)
+  decoder = RNN_Decoder(embedding_dim, units, new_v.vocabulary_size())
+  optimizer = tf.keras.optimizers.Adam(learning_rate=3e-4)
+
+  checkpoint_path = "/tmp/checkpoint/"
+  ckpt = tf.train.Checkpoint(encoder=encoder,
+                            decoder=decoder,
+                            optimizer=optimizer)
+  ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
+  ckpt.restore(ckpt_manager.latest_checkpoint)
+
+  image = request.files["file"]
+  prediction = ' '.join(evaluate(image, decoder, encoder, word_to_index, index_to_word, image_features_extract_model))
+  
+  return {
+      'prediction': prediction,
+  }
